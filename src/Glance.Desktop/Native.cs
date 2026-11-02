@@ -70,5 +70,6 @@ public sealed class GlobalHotkey : IDisposable
     }
     private IntPtr Hook(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam, ref bool handled)
     { if (msg == 0x0312 && wparam.ToInt32() == activeId) { handled = true; action(); } return IntPtr.Zero; }
-    public void Dispose() { if (activeId != 0) UnregisterHotKey(source.Handle, activeId); source.RemoveHook(Hook); }
+    public void Clear() { if (activeId != 0) UnregisterHotKey(source.Handle, activeId); activeId = 0; Current = ""; }
+    public void Dispose() { Clear(); source.RemoveHook(Hook); }
 }

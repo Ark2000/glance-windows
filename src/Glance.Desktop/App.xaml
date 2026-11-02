@@ -3,6 +3,12 @@
     <SolidColorBrush x:Key="Ink" Color="#252638" />
     <SolidColorBrush x:Key="Muted" Color="#717284" />
     <SolidColorBrush x:Key="Accent" Color="#6255CA" />
+    <DataTemplate x:Key="HistoryItem">
+      <StackPanel Margin="6,5">
+        <TextBlock Text="{Binding Question}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+        <TextBlock Text="{Binding Details}" FontSize="10" Foreground="{StaticResource Muted}" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" />
+      </StackPanel>
+    </DataTemplate>
     <Style TargetType="Window"><Setter Property="FontFamily" Value="Microsoft YaHei UI" /><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="{StaticResource Ink}" /><Setter Property="Background" Value="#FAFAFC" /><Setter Property="TextOptions.TextFormattingMode" Value="Display" /></Style>
     <Style TargetType="TextBox">
       <Setter Property="Padding" Value="10,9" /><Setter Property="BorderBrush" Value="#DDDDE8" /><Setter Property="BorderThickness" Value="1" /><Setter Property="Background" Value="White" /><Setter Property="Foreground" Value="{StaticResource Ink}" /><Setter Property="VerticalContentAlignment" Value="Center" /><Setter Property="SelectionBrush" Value="#CCC6F4" />

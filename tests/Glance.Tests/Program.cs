@@ -94,6 +94,44 @@ Test("Budget reservation persists across restart and history deletion", () =>
     Check(ledger.DayTotal(now.AddDays(1)) == 0); Check(ledger.MonthTotal(now.AddMonths(1)) == 0);
 });
 
+Test("Concurrent budget mutations preserve the limit and persisted total", () =>
+{
+    var store = new LocalStore(Path.Combine(root, "parallel-budget")); var ledger = new BudgetLedger(store);
+    var now = DateTimeOffset.Now; var amount = defaults.Reserve("q");
+    var settings = defaults with { DailyLimit = amount * 4 }; var accepted = 0;
+    Parallel.For(0, 24, _ =>
+    {
+        try { ledger.Reserve(settings, "q", now); Interlocked.Increment(ref accepted); }
+        catch (InvalidOperationException) { }
+    });
+    Check(accepted == 4); Check(ledger.DayTotal(now) == amount * 4);
+    Check(new BudgetLedger(store).DayTotal(now) == amount * 4);
+});
+
+AsyncTest("Streaming buffer coalesces burst chunks without losing or repeating text", async () =>
+{
+    var buffer = new StreamingTextBuffer(); var received = new StringBuilder();
+    var producer = Task.Run(() => { for (var i = 0; i < 20000; i++) buffer.Append(i + ","); });
+    while (!producer.IsCompleted) { received.Append(buffer.Drain()); await Task.Yield(); }
+    await producer;
+    string remaining;
+    while ((remaining = buffer.Drain()).Length > 0) received.Append(remaining);
+    Check(received.ToString() == buffer.Text); Check(buffer.Length == received.Length); Check(buffer.Drain() == "");
+    var limited = new StreamingTextBuffer(5); limited.Append("abc"); Check(limited.Drain() == "abc");
+    Throws<ApiException>(() => limited.Append("xyz")); Check(limited.Text == "abc"); Check(limited.Drain() == "");
+    var unicode = new StreamingTextBuffer(); unicode.Append("a😀b");
+    Check(unicode.Drain(2) == "a"); Check(unicode.Drain(1) == "😀"); Check(unicode.Drain(2) == "b");
+});
+
+Test("History loading observes cancellation and mutation revisions", () =>
+{
+    var store = new LocalStore(Path.Combine(root, "history-cancel")); Check(store.HistoryRevision == 0);
+    var entry = new HistoryEntry(Guid.NewGuid(), DateTimeOffset.Now, "q", "a", "test", "done", 0, false);
+    store.SaveHistory(entry); Check(store.HistoryRevision == 1);
+    Throws<OperationCanceledException>(() => store.History(cancellationToken: new CancellationToken(true)));
+    store.DeleteHistory(entry.Id); Check(store.HistoryRevision == 2); Check(store.History().Count == 0);
+});
+
 AsyncTest("Streaming UTF-8, keepalive, same-chunk usage, single-turn payload", async () =>
 {
     string? payload = null;
@@ -162,7 +200,7 @@ AsyncTest("SSE error and malformed data report failure", async () =>
     }
 });
 
-Test("Desktop startup initializes tray/hotkey and renders compact layouts", () =>
+Test("Desktop compact layouts, burst responsiveness, cancellation and virtual history", () =>
 {
     Exception? failure = null;
     var thread = new Thread(() =>
@@ -171,25 +209,90 @@ Test("Desktop startup initializes tray/hotkey and renders compact layouts", () =
         try
         {
             var app = new App(); app.InitializeComponent();
-            window = new MainWindow(new LocalStore(Path.Combine(root, "desktop")), defaults with { Hotkey = "Ctrl+Alt+Shift+F9" });
+            var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            SynchronizationContext.SetSynchronizationContext(new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+            var desktopStore = new LocalStore(Path.Combine(root, "desktop"));
+            var burst = string.Concat(Enumerable.Repeat("data: {\"choices\":[{\"delta\":{\"content\":\"xy\"}}]}\n\n", 8000)) + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n";
+            var slow = false;
+            var client = new HttpClient(new FakeHandler(async (_, token) =>
+            {
+                Check(!dispatcher.CheckAccess(), "Network processing must leave the input dispatcher available");
+                if (slow) await Task.Delay(5000, token);
+                return Sse(burst);
+            }));
+            window = new MainWindow(desktopStore, defaults with { Hotkey = "Ctrl+Alt+Shift+F9", EncryptedKey = KeyVault.Encrypt("synthetic-desktop-test") }, client);
             window.Show();
-            System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
-            Check(((System.Windows.Controls.TextBlock)window.FindName("ShortcutLabel")).Text == "Ctrl+Alt+Shift+F9 唤起", "Global hotkey must initialize after XAML creates a window handle");
-            Check(!((System.Windows.Controls.Button)window.FindName("AskButton")).IsEnabled, "Empty query must be disabled");
-            window.Width = 400; window.Height = 420; window.UpdateLayout();
-            Check(((System.Windows.Controls.TextBox)window.FindName("Question")).ActualWidth > 180, "Compact question width: " + ((System.Windows.Controls.TextBox)window.FindName("Question")).ActualWidth);
-            Check(((System.Windows.Controls.TextBox)window.FindName("Answer")).ActualHeight > 50, "Compact answer height: " + ((System.Windows.Controls.TextBox)window.FindName("Answer")).ActualHeight);
+            dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            var question = (System.Windows.Controls.TextBox)window.FindName("Question");
+            var answer = (System.Windows.Controls.TextBox)window.FindName("Answer");
+            var ask = (System.Windows.Controls.Button)window.FindName("AskButton");
+            var clear = (System.Windows.Controls.Button)window.FindName("NewButton");
+            Check(((System.Windows.Controls.TextBlock)window.FindName("ShortcutLabel")).Text == "Ctrl+Alt+Shift+F9", "Hotkey initialization failed");
+            Check(!ask.IsEnabled, "Empty query must be disabled");
+            Check(window.Height == 116 && window.Width == 420, "Idle window must stay compact");
+            Check(((System.Windows.Controls.Border)window.FindName("AnswerPanel")).Visibility == System.Windows.Visibility.Collapsed);
+            Check(window.Review(new HistoryEntry(Guid.NewGuid(), DateTimeOffset.Now, "q", "answer", "test", "done", 0, false)));
+            Check(window.Height == 280, "Answer expands only when needed");
+            window.Width = 340; window.Height = 196; window.UpdateLayout();
+            Check(question.ActualWidth > 200, "Compact input must stay usable");
+            Check(answer.ActualHeight > 25, "Compact answer must remain visible");
             foreach (var scale in new[] { 1d, 1.25, 1.5, 2 })
             {
-                var bitmap = new System.Windows.Media.Imaging.RenderTargetBitmap((int)(400 * scale), (int)(420 * scale), 96 * scale, 96 * scale, System.Windows.Media.PixelFormats.Pbgra32);
-                bitmap.Render(window); Check(bitmap.PixelWidth == (int)(400 * scale));
+                var bitmap = new System.Windows.Media.Imaging.RenderTargetBitmap((int)(340 * scale), (int)(196 * scale), 96 * scale, 96 * scale, System.Windows.Media.PixelFormats.Pbgra32);
+                bitmap.Render(window); Check(bitmap.PixelWidth == (int)(340 * scale));
             }
+            clear.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            Check(window.Height == 116 && answer.Text.Length == 0, "Clear must restore the compact input");
+            window.Width = 420;
+
+            var ticks = 0; var lastTick = System.Diagnostics.Stopwatch.GetTimestamp(); var largestGap = TimeSpan.Zero;
+            var heartbeat = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(10) };
+            heartbeat.Tick += (_, _) =>
+            {
+                var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(lastTick); lastTick = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (elapsed > largestGap) largestGap = elapsed; ticks++;
+            };
+            heartbeat.Start(); PumpUntil(() => ticks >= 2, TimeSpan.FromSeconds(2));
+            question.Text = "burst";
+            ask.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            PumpUntil(() => ask.IsEnabled, TimeSpan.FromSeconds(10)); heartbeat.Stop();
+            Check(answer.Text == string.Concat(Enumerable.Repeat("xy", 8000)), "Final stream flush lost content");
+            Check(desktopStore.History("burst").Single().Answer == answer.Text);
+            Check(largestGap < TimeSpan.FromMilliseconds(500), "Input dispatcher stalled during burst: " + largestGap.TotalMilliseconds);
+            Console.WriteLine($"METRIC 8000 SSE chunks: max input heartbeat gap {largestGap.TotalMilliseconds:F1} ms");
+
+            slow = true; question.Text = "cancel";
+            ask.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            var stopWatch = System.Diagnostics.Stopwatch.StartNew();
+            ((System.Windows.Controls.Button)window.FindName("StopButton")).RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            PumpUntil(() => ask.IsEnabled, TimeSpan.FromSeconds(3));
+            Check(stopWatch.Elapsed < TimeSpan.FromSeconds(1), "Stop was delayed");
+            Check(desktopStore.History("cancel").Single().Status == "已停止");
+
+            var historyStore = new LocalStore(Path.Combine(root, "large-history"));
+            for (var i = 0; i < 5000; i++)
+            {
+                var entry = new HistoryEntry(Guid.NewGuid(), DateTimeOffset.Now.AddSeconds(-i), "concept " + i, i == 4999 ? "unique-marker" : "definition", "test", "done", 0, false);
+                File.WriteAllText(Path.Combine(historyStore.Root, "history", entry.Id + ".json"), JsonSerializer.Serialize(entry));
+            }
+            var history = new HistoryWindow(historyStore, _ => true); history.Show();
+            var historyList = Descendants<System.Windows.Controls.ListBox>(history).Single();
+            PumpUntil(() => historyList.Items.Count == 5000, TimeSpan.FromSeconds(10)); history.UpdateLayout();
+            var realized = Enumerable.Range(0, 5000).Count(i => historyList.ItemContainerGenerator.ContainerFromIndex(i) is not null);
+            Check(realized < 80, "History created off-screen controls: " + realized);
+            var historySearch = Descendants<System.Windows.Controls.TextBox>(history).Single(box => System.Windows.Automation.AutomationProperties.GetName(box) == "搜索历史");
+            historySearch.Text = "missing"; historySearch.Text = "unique-marker";
+            PumpUntil(() => historyList.Items.Count == 1, TimeSpan.FromSeconds(3));
+            Check(((HistoryRow)historyList.Items[0]).Entry.Question == "concept 4999", "Latest search must win");
+            Console.WriteLine($"METRIC 5000 history records: {realized} realized row controls");
+            historySearch.Text = "definition"; history.Close();
+            dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
         }
         catch (Exception ex) { failure = ex; }
         finally { window?.Quit(); }
     });
     thread.SetApartmentState(ApartmentState.STA); thread.Start();
-    Check(thread.Join(TimeSpan.FromSeconds(20)), "Desktop smoke test timed out");
+    Check(thread.Join(TimeSpan.FromSeconds(45)), "Desktop smoke test timed out");
     if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
 });
 
@@ -207,6 +310,24 @@ finally { Directory.Delete(root, true); }
 return failures == 0 ? 0 : 1;
 
 static HttpResponseMessage Sse(string content) => new(HttpStatusCode.OK) { Content = new StreamContent(new ByteStream(Encoding.UTF8.GetBytes(content))) };
+static void PumpUntil(Func<bool> condition, TimeSpan timeout)
+{
+    var frame = new System.Windows.Threading.DispatcherFrame();
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    var timer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(5) };
+    timer.Tick += (_, _) => { if (condition() || watch.Elapsed > timeout) frame.Continue = false; };
+    timer.Start(); System.Windows.Threading.Dispatcher.PushFrame(frame); timer.Stop();
+    if (!condition()) throw new Exception("Desktop condition timed out");
+}
+static IEnumerable<T> Descendants<T>(System.Windows.DependencyObject parent) where T : System.Windows.DependencyObject
+{
+    for (var index = 0; index < System.Windows.Media.VisualTreeHelper.GetChildrenCount(parent); index++)
+    {
+        var child = System.Windows.Media.VisualTreeHelper.GetChild(parent, index);
+        if (child is T match) yield return match;
+        foreach (var nested in Descendants<T>(child)) yield return nested;
+    }
+}
 sealed class FakeHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request, cancellationToken);

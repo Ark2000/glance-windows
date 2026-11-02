@@ -9,6 +9,8 @@ public sealed class LocalStore
 {
     public static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
     public string Root { get; }
+    private long historyRevision;
+    public long HistoryRevision => Interlocked.Read(ref historyRevision);
     public LocalStore(string root)
     {
         Root = root;
@@ -21,6 +23,7 @@ public sealed class LocalStore
         var path = Path.Combine(Root, name);
         if (!File.Exists(path)) return fallback;
         try { return JsonSerializer.Deserialize<T>(File.ReadAllText(path), JsonOptions) ?? throw new JsonException(); }
+        catch (FileNotFoundException) { return fallback; }
         catch (JsonException) { throw new IOException($"本机文件 {name} 格式损坏。请先备份并修复该文件。原文件已保留。"); }
     }
 
@@ -36,42 +39,64 @@ public sealed class LocalStore
         File.Move(temp, path, true);
     }
 
-    public List<HistoryEntry> History(string search = "") => Directory.EnumerateFiles(Path.Combine(Root, "history"), "*.json")
-        .Select(p => Read<HistoryEntry?>(Path.Combine("history", Path.GetFileName(p)), null))
-        .OfType<HistoryEntry>()
-        .Where(e => e.Question.Contains(search, StringComparison.OrdinalIgnoreCase) || e.Answer.Contains(search, StringComparison.OrdinalIgnoreCase))
-        .OrderByDescending(e => e.Time).ToList();
-    public void SaveHistory(HistoryEntry entry) => Write(Path.Combine("history", entry.Id + ".json"), entry);
-    public void DeleteHistory(Guid id) => File.Delete(Path.Combine(Root, "history", id + ".json"));
+    public List<HistoryEntry> History(string search = "", CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var entries = new List<HistoryEntry>();
+        foreach (var path in Directory.EnumerateFiles(Path.Combine(Root, "history"), "*.json"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entry = Read<HistoryEntry?>(Path.Combine("history", Path.GetFileName(path)), null);
+            if (entry is not null && (entry.Question.Contains(search, StringComparison.OrdinalIgnoreCase) || entry.Answer.Contains(search, StringComparison.OrdinalIgnoreCase))) entries.Add(entry);
+        }
+        return entries.OrderByDescending(e => e.Time).ToList();
+    }
+    public void SaveHistory(HistoryEntry entry)
+    {
+        Write(Path.Combine("history", entry.Id + ".json"), entry);
+        Interlocked.Increment(ref historyRevision);
+    }
+    public void DeleteHistory(Guid id)
+    {
+        File.Delete(Path.Combine(Root, "history", id + ".json"));
+        Interlocked.Increment(ref historyRevision);
+    }
 }
 
 public sealed class BudgetLedger
 {
     private readonly LocalStore store;
+    private readonly object gate = new();
     private List<Charge> charges;
     public BudgetLedger(LocalStore store)
     {
         this.store = store;
         charges = store.Read("ledger.json", new List<Charge>());
     }
-    public decimal DayTotal(DateTimeOffset time) => charges.Where(c => c.Time.ToLocalTime().Date == time.ToLocalTime().Date).Sum(c => c.Amount);
-    public decimal MonthTotal(DateTimeOffset time) => charges.Where(c => c.Time.ToLocalTime().Year == time.ToLocalTime().Year && c.Time.ToLocalTime().Month == time.ToLocalTime().Month).Sum(c => c.Amount);
+    public decimal DayTotal(DateTimeOffset time) => Volatile.Read(ref charges).Where(c => c.Time.ToLocalTime().Date == time.ToLocalTime().Date).Sum(c => c.Amount);
+    public decimal MonthTotal(DateTimeOffset time) => Volatile.Read(ref charges).Where(c => c.Time.ToLocalTime().Year == time.ToLocalTime().Year && c.Time.ToLocalTime().Month == time.ToLocalTime().Month).Sum(c => c.Amount);
     public Charge Reserve(Settings settings, string question, DateTimeOffset time)
     {
-        var amount = settings.Reserve(question);
-        if (amount > settings.RequestLimit) throw new InvalidOperationException("本次预留费用超过单次限额。请缩短输入、降低输出长度或调整限额。");
-        if (DayTotal(time) + amount > settings.DailyLimit) throw new InvalidOperationException("今日可用额度不足，请调整设置或次日再试。");
-        if (MonthTotal(time) + amount > settings.MonthlyLimit) throw new InvalidOperationException("本月可用额度不足，请调整设置或下月再试。");
-        var charge = new Charge(Guid.NewGuid(), time, amount, true);
-        Commit([.. charges, charge]);
-        return charge;
+        lock (gate)
+        {
+            var amount = settings.Reserve(question);
+            if (amount > settings.RequestLimit) throw new InvalidOperationException("本次预留费用超过单次限额。请缩短输入、降低输出长度或调整限额。");
+            if (DayTotal(time) + amount > settings.DailyLimit) throw new InvalidOperationException("今日可用额度不足，请调整设置或次日再试。");
+            if (MonthTotal(time) + amount > settings.MonthlyLimit) throw new InvalidOperationException("本月可用额度不足，请调整设置或下月再试。");
+            var charge = new Charge(Guid.NewGuid(), time, amount, true);
+            Commit([.. charges, charge]);
+            return charge;
+        }
     }
     public Charge Settle(Charge charge, Settings settings, Usage? usage, bool rejected = false)
     {
-        var amount = rejected ? 0 : usage is null ? charge.Amount : (usage.InputTokens * settings.InputRate + usage.OutputTokens * settings.OutputRate) / 1_000_000m;
-        var updated = charge with { Amount = amount, Estimated = usage is null && !rejected };
-        Commit(charges.Select(c => c.Id == charge.Id ? updated : c).ToList());
-        return updated;
+        lock (gate)
+        {
+            var amount = rejected ? 0 : usage is null ? charge.Amount : (usage.InputTokens * settings.InputRate + usage.OutputTokens * settings.OutputRate) / 1_000_000m;
+            var updated = charge with { Amount = amount, Estimated = usage is null && !rejected };
+            Commit(charges.Select(c => c.Id == charge.Id ? updated : c).ToList());
+            return updated;
+        }
     }
-    private void Commit(List<Charge> next) { store.Write("ledger.json", next); charges = next; }
+    private void Commit(List<Charge> next) { store.Write("ledger.json", next); Volatile.Write(ref charges, next); }
 }

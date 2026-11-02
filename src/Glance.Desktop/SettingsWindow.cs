@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -16,13 +17,13 @@ public sealed class SettingsWindow : Window
     private readonly CheckBox thinking = new() { Content = "启用思考模式（响应时间与用量会增加）", Margin = new Thickness(0, 12, 0, 12) };
     private readonly TextBlock message = new() { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.Firebrick, Margin = new Thickness(0, 0, 0, 10) };
     private readonly Settings original;
-    public SettingsWindow(Settings current, string root, BudgetLedger ledger, Action<Settings> save)
+    public SettingsWindow(Settings current, string root, BudgetLedger ledger, Func<Settings, Task> save)
     {
-        original = current; Title = "知隙 · 设置"; Style = (Style)Application.Current.FindResource(typeof(Window)); Width = 620; Height = 730; MinWidth = 420; MinHeight = 400;
+        original = current; Title = "知隙 · 设置"; Style = (Style)Application.Current.FindResource(typeof(Window)); Width = 540; Height = 600; MinWidth = 400; MinHeight = 360;
         MaxHeight = SystemParameters.WorkArea.Height; MaxWidth = SystemParameters.WorkArea.Width; WindowStartupLocation = WindowStartupLocation.CenterScreen;
-        var grid = new Grid { Margin = new Thickness(22) };
+        var grid = new Grid { Margin = new Thickness(14) };
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); grid.RowDefinitions.Add(new RowDefinition()); grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var title = new TextBlock { Text = "按你的习惯回答", FontSize = 22, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 18) }; grid.Children.Add(title);
+        var title = new TextBlock { Text = "设置", FontSize = 18, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 10) }; grid.Children.Add(title);
         var tabs = new TabControl(); Grid.SetRow(tabs, 1); grid.Children.Add(tabs);
         var basic = Tab(tabs, "连接与回答");
         Note(basic, "填写自己的 API Key。查询内容和回答指令会发送至所设接口；历史记录保存在本机。默认使用 DeepSeek 非思考模式。");
@@ -58,10 +59,20 @@ public sealed class SettingsWindow : Window
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var cancel = new Button { Content = "取消" }; cancel.Click += (_, _) => Close();
         var submit = new Button { Content = "保存并生效", Style = (Style)FindResource("Primary") };
-        submit.Click += (_, _) =>
+        var saving = false;
+        Closing += (_, e) => { if (saving) e.Cancel = true; };
+        submit.Click += async (_, _) =>
         {
-            try { var next = Read(); next.Validate(); save(next); Close(); }
+            var saved = false;
+            try
+            {
+                var next = Read(); next.Validate(); saving = true;
+                submit.IsEnabled = cancel.IsEnabled = tabs.IsEnabled = false; message.Text = "正在保存…";
+                await save(next); saved = true;
+            }
             catch (Exception ex) { message.Text = ex is System.ComponentModel.Win32Exception ? ex.Message : App.SafeError(ex); }
+            finally { saving = false; submit.IsEnabled = cancel.IsEnabled = tabs.IsEnabled = true; }
+            if (saved) Close();
         };
         buttons.Children.Add(cancel); buttons.Children.Add(submit); bottom.Children.Add(buttons); Content = grid;
         PreviewKeyDown += (_, e) => { if (e.Key == System.Windows.Input.Key.Escape) Close(); };
