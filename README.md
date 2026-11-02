@@ -90,6 +90,8 @@ dotnet run --project src/Glance.Desktop
 
 GitHub Actions 在 Windows 上测试并打包，产物含 EXE 与 SHA-256 校验文件。
 
+维护者可手动运行「Publish Windows release」工作流，指定版本 tag，在 GitHub 构建并发布发行附件。
+
 ```text
 src/Glance.Core/       SSE 客户端、设置校验、本机存储、预算账本、导出
 src/Glance.Desktop/    WPF 浮窗、设置、历史、托盘、全局快捷键、DPAPI

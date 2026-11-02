@@ -1,0 +1,42 @@
+name: Publish Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        default: v1.0.0
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test and build
+        shell: pwsh
+        run: |
+          ./scripts/publish.ps1
+          $hash = (Get-FileHash dist/win-x64/Glance.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$PWD/dist/win-x64/SHA256SUMS.txt", "$hash  Glance.exe`n", [System.Text.UTF8Encoding]::new($false))
+      - name: Upload and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$') { throw 'Expected a semantic version tag' }
+          gh release view $env:RELEASE_TAG --json tagName
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --draft --generate-notes --target $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+          }
+          gh release upload $env:RELEASE_TAG dist/win-x64/Glance.exe dist/win-x64/SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          gh release edit $env:RELEASE_TAG --draft=false --latest --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
