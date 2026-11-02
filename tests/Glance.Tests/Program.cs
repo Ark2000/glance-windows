@@ -214,10 +214,15 @@ Test("Desktop compact layouts, burst responsiveness, cancellation and virtual hi
             var desktopStore = new LocalStore(Path.Combine(root, "desktop"));
             var burst = string.Concat(Enumerable.Repeat("data: {\"choices\":[{\"delta\":{\"content\":\"xy\"}}]}\n\n", 8000)) + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n";
             var slow = false;
+            var slowRequestStarted = 0;
             var client = new HttpClient(new FakeHandler(async (_, token) =>
             {
                 Check(!dispatcher.CheckAccess(), "Network processing must leave the input dispatcher available");
-                if (slow) await Task.Delay(5000, token);
+                if (slow)
+                {
+                    Volatile.Write(ref slowRequestStarted, 1);
+                    await Task.Delay(5000, token);
+                }
                 return Sse(burst);
             }));
             window = new MainWindow(desktopStore, defaults with { Hotkey = "Ctrl+Alt+Shift+F9", EncryptedKey = KeyVault.Encrypt("synthetic-desktop-test") }, client);
@@ -263,6 +268,7 @@ Test("Desktop compact layouts, burst responsiveness, cancellation and virtual hi
 
             slow = true; question.Text = "cancel";
             ask.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+            PumpUntil(() => Volatile.Read(ref slowRequestStarted) == 1, TimeSpan.FromSeconds(3));
             var stopWatch = System.Diagnostics.Stopwatch.StartNew();
             ((System.Windows.Controls.Button)window.FindName("StopButton")).RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
             PumpUntil(() => ask.IsEnabled, TimeSpan.FromSeconds(3));
