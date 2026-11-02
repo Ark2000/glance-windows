@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+dist/
+.vs/
+*.user
+*.pfx
+*.key
+*.log
+test-results/
+.local/
